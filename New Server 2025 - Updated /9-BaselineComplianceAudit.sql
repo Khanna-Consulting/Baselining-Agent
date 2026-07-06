@@ -111,6 +111,23 @@ IF NOT EXISTS (SELECT * FROM sys.database_permissions WHERE
     PRINT 'PASS: xp_dirtree revoked from PUBLIC'
 ELSE
     PRINT 'FAIL: xp_dirtree still granted to PUBLIC'
+
+-- Check sa renamed (control 2.17)
+IF NOT EXISTS (SELECT * FROM sys.server_principals WHERE name = 'sa')
+    PRINT 'PASS: sa login renamed'
+ELSE
+    PRINT 'FAIL: sa login not renamed (still named "sa")'
+
+-- Check SQL Server Audit created (control 5.4)
+IF EXISTS (SELECT * FROM sys.server_audits WHERE name = 'COV_Baseline_Audit' AND is_state_enabled = 1)
+    PRINT 'PASS: COV_Baseline_Audit exists and enabled'
+ELSE
+    PRINT 'FAIL: COV_Baseline_Audit not found or not enabled'
+
+IF EXISTS (SELECT * FROM sys.server_audit_specifications WHERE name = 'COV_Baseline_Audit_Spec' AND is_state_enabled = 1)
+    PRINT 'PASS: COV_Baseline_Audit_Spec exists and enabled'
+ELSE
+    PRINT 'FAIL: COV_Baseline_Audit_Spec not found or not enabled'
 PRINT ''
 GO
 
@@ -164,10 +181,19 @@ PRINT 'NOTE: TLS 1.0/1.1 disabled and TLS 1.3 enabled must be verified at OS lev
 PRINT ''
 GO
 
--- Script 8: SSL Check
+-- Script 8: SSL/Encryption
 PRINT '--- Script 8: Network Encryption ---'
+DECLARE @ForceEnc INT
+EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE',
+    N'SOFTWARE\Microsoft\Microsoft SQL Server\MSSQLServer\SuperSocketNetLib',
+    N'ForceEncryption', @ForceEnc OUTPUT
+IF @ForceEnc = 1
+    PRINT 'PASS: ForceEncryption registry value = 1'
+ELSE
+    PRINT 'FAIL: ForceEncryption registry value not set to 1'
+
 IF EXISTS (SELECT * FROM sys.dm_exec_connections WHERE encrypt_option = 'FALSE')
-    PRINT 'FAIL: Unencrypted connections detected'
+    PRINT 'WARNING: Unencrypted connections still active (service restart required for ForceEncryption to take effect)'
 ELSE
     PRINT 'PASS: All active connections encrypted'
 PRINT ''
@@ -220,7 +246,7 @@ SELECT name AS [Control],
            WHEN name = 'cross db ownership chaining' THEN CASE WHEN CAST(value_in_use AS int) = 0 THEN 'PASS' ELSE 'FAIL' END
            WHEN name = 'Database Mail XPs' THEN CASE WHEN CAST(value_in_use AS int) = 1 THEN 'EXCEPTION (DBA team uses DB Mail)' ELSE 'PASS' END
            WHEN name = 'Ole Automation Procedures' THEN CASE WHEN CAST(value_in_use AS int) = 0 THEN 'PASS' ELSE 'FAIL' END
-           WHEN name = 'remote access' THEN CASE WHEN CAST(value_in_use AS int) = 0 THEN 'PASS' ELSE 'FAIL' END
+           WHEN name = 'remote access' THEN CASE WHEN CAST(value_in_use AS int) = 0 THEN 'PASS' ELSE 'WARNING (deprecated, requires restart)' END
            WHEN name = 'remote admin connections' THEN CASE WHEN CAST(value_in_use AS int) = 0 THEN 'PASS' ELSE 'FAIL' END
            WHEN name = 'scan for startup procs' THEN CASE WHEN CAST(value_in_use AS int) = 0 THEN 'PASS' ELSE 'FAIL' END
            WHEN name = 'xp_cmdshell' THEN CASE WHEN CAST(value_in_use AS int) = 0 THEN 'PASS' ELSE 'FAIL' END
@@ -486,7 +512,10 @@ GO
 PRINT '--- 5.4: SQL Server Audit ---'
 IF EXISTS (SELECT * FROM sys.server_audits)
 BEGIN
-    SELECT name, status_desc, type_desc, 'EXISTS' AS [Status] FROM sys.server_audits
+    SELECT name, is_state_enabled,
+           CASE WHEN is_state_enabled = 1 THEN 'STARTED' ELSE 'STOPPED' END AS [State],
+           type_desc, 'EXISTS' AS [Status]
+    FROM sys.server_audits
     SELECT sas.name AS [SpecName], sas.is_state_enabled,
            CASE WHEN sas.is_state_enabled = 1 THEN 'PASS' ELSE 'FAIL (not enabled)' END AS [Status]
     FROM sys.server_audit_specifications sas
@@ -605,12 +634,133 @@ PRINT ''
 GO
 
 -- ============================================================================
--- SUMMARY
+-- SUMMARY: Collect and display all non-passing controls
 -- ============================================================================
 
 PRINT '================================================================'
+PRINT '  FAILED / WARNING CONTROLS SUMMARY'
+PRINT '================================================================'
+PRINT ''
+
+-- Collect failures into a temp table
+CREATE TABLE #AuditResults (ControlID VARCHAR(10), ControlName VARCHAR(100), Status VARCHAR(20))
+
+-- 2.1-2.8, 2.15: sp_configure (excluding remote access - deprecated, requires restart)
+INSERT #AuditResults
+SELECT CASE name
+    WHEN 'Ad Hoc Distributed Queries' THEN '2.1'
+    WHEN 'clr enabled' THEN '2.2'
+    WHEN 'cross db ownership chaining' THEN '2.3'
+    WHEN 'Ole Automation Procedures' THEN '2.5'
+    WHEN 'remote admin connections' THEN '2.7'
+    WHEN 'scan for startup procs' THEN '2.8'
+    WHEN 'xp_cmdshell' THEN '2.15'
+    WHEN 'default trace enabled' THEN '5.2'
+    END,
+    name, 'FAIL'
+FROM sys.configurations
+WHERE (name = 'Ad Hoc Distributed Queries' AND CAST(value_in_use AS int) <> 0)
+   OR (name = 'clr enabled' AND CAST(value_in_use AS int) <> 0)
+   OR (name = 'cross db ownership chaining' AND CAST(value_in_use AS int) <> 0)
+   OR (name = 'Ole Automation Procedures' AND CAST(value_in_use AS int) <> 0)
+   OR (name = 'remote admin connections' AND CAST(value_in_use AS int) <> 0)
+   OR (name = 'scan for startup procs' AND CAST(value_in_use AS int) <> 0)
+   OR (name = 'xp_cmdshell' AND CAST(value_in_use AS int) <> 0)
+   OR (name = 'default trace enabled' AND CAST(value_in_use AS int) <> 1)
+
+-- 2.6: remote access (deprecated SQL 2022, removed SQL 2025 - requires restart)
+IF EXISTS (SELECT * FROM sys.configurations WHERE name = 'remote access' AND CAST(value_in_use AS int) <> 0)
+    INSERT #AuditResults VALUES ('2.6', 'remote access=1 (deprecated, requires service restart to clear)', 'WARNING')
+
+-- 2.9: Trustworthy
+IF EXISTS (SELECT name FROM sys.databases WHERE is_trustworthy_on = 1 AND name NOT IN ('msdb'))
+    INSERT #AuditResults VALUES ('2.9', 'Trustworthy ON found on user database(s)', 'FAIL')
+
+-- 2.12: Hide Instance
+DECLARE @HideSummary INT
+EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE',
+    N'SOFTWARE\Microsoft\Microsoft SQL Server\MSSQLServer\SuperSocketNetLib',
+    N'HideInstance', @HideSummary OUTPUT
+IF ISNULL(@HideSummary, 0) <> 1
+    INSERT #AuditResults VALUES ('2.12', 'Hide Instance not enabled', 'FAIL')
+
+-- 2.13: sa disabled
+IF EXISTS (SELECT * FROM sys.server_principals WHERE sid = 0x01 AND is_disabled = 0)
+    INSERT #AuditResults VALUES ('2.13', 'sa account not disabled', 'FAIL')
+
+-- 2.14/2.17: sa renamed
+IF EXISTS (SELECT * FROM sys.server_principals WHERE name = 'sa')
+    INSERT #AuditResults VALUES ('2.17', 'Login named "sa" still exists', 'FAIL')
+
+-- 2.16: AUTO_CLOSE
+IF EXISTS (SELECT name FROM sys.databases WHERE is_auto_close_on = 1)
+    INSERT #AuditResults VALUES ('2.16', 'AUTO_CLOSE ON found on database(s)', 'FAIL')
+
+-- 3.2: Guest CONNECT
+CREATE TABLE #GuestSummary (DatabaseName SYSNAME)
+EXEC sp_MSforeachdb '
+USE [?];
+IF DB_NAME() NOT IN (''master'',''msdb'',''tempdb'')
+IF EXISTS (SELECT * FROM sys.database_permissions p
+JOIN sys.database_principals dp ON p.grantee_principal_id = dp.principal_id
+WHERE dp.name = ''guest'' AND p.permission_name = ''CONNECT'' AND p.state_desc = ''GRANT'')
+INSERT INTO #GuestSummary VALUES (DB_NAME())'
+IF EXISTS (SELECT * FROM #GuestSummary)
+    INSERT #AuditResults VALUES ('3.2', 'Guest CONNECT not revoked in user database(s)', 'FAIL')
+DROP TABLE #GuestSummary
+
+-- 3.9: BUILTIN groups
+IF EXISTS (SELECT * FROM sys.server_principals WHERE name LIKE 'BUILTIN%')
+    INSERT #AuditResults VALUES ('3.9', 'BUILTIN group logins exist', 'FAIL')
+
+-- 3.10: Local groups
+IF EXISTS (SELECT * FROM sys.server_principals WHERE type_desc = 'WINDOWS_GROUP'
+           AND name LIKE CAST(SERVERPROPERTY('MachineName') AS VARCHAR) + '%')
+    INSERT #AuditResults VALUES ('3.10', 'Local Windows group logins exist', 'FAIL')
+
+-- 5.1: Error logs
+DECLARE @NumLogsSummary INT
+EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE',
+    N'Software\Microsoft\MSSQLServer\MSSQLServer', N'NumErrorLogs', @NumLogsSummary OUTPUT
+IF ISNULL(@NumLogsSummary, 0) < 12
+    INSERT #AuditResults VALUES ('5.1', 'NumErrorLogs < 12', 'FAIL')
+
+-- 5.4: Server Audit
+IF NOT EXISTS (SELECT * FROM sys.server_audits WHERE is_state_enabled = 1)
+    INSERT #AuditResults VALUES ('5.4', 'No SQL Server Audit enabled', 'FAIL')
+
+-- 7.4: Encryption
+DECLARE @ForceEncSummary INT
+EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE',
+    N'SOFTWARE\Microsoft\Microsoft SQL Server\MSSQLServer\SuperSocketNetLib',
+    N'ForceEncryption', @ForceEncSummary OUTPUT
+IF ISNULL(@ForceEncSummary, 0) <> 1
+    INSERT #AuditResults VALUES ('7.4', 'ForceEncryption not set', 'FAIL')
+ELSE IF EXISTS (SELECT * FROM sys.dm_exec_connections WHERE encrypt_option = 'FALSE')
+    INSERT #AuditResults VALUES ('7.4', 'ForceEncryption set but unencrypted connections active (restart needed)', 'WARNING')
+
+-- Display results
+DECLARE @IssueCount INT
+SELECT @IssueCount = COUNT(*) FROM #AuditResults
+
+IF @IssueCount > 0
+BEGIN
+    PRINT ''
+    SELECT ControlID, ControlName, Status FROM #AuditResults ORDER BY ControlID
+    PRINT ''
+    PRINT '  Total issues: ' + CAST(@IssueCount AS VARCHAR)
+END
+ELSE
+BEGIN
+    PRINT ''
+    PRINT '  *** ALL CONTROLS PASSING ***'
+    PRINT ''
+END
+
+DROP TABLE #AuditResults
+GO
+
+PRINT '================================================================'
 PRINT '  AUDIT COMPLETE - ' + CONVERT(VARCHAR, GETDATE(), 120)
-PRINT '  Review results above for any FAIL items.'
-PRINT '  EXCEPTION items have documented differential reasoning.'
 PRINT '================================================================'
 GO

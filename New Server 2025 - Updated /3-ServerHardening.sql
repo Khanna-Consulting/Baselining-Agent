@@ -9,6 +9,8 @@
 -- 2. Wrapped 'remote access' in TRY/CATCH for SQL 2025 (option removed)
 -- 3. Uncommented Hide Instance registry write (control 2.12)
 -- 4. NumErrorLogs set to 30 (matches CycleErrorLog, satisfies control 5.1)
+-- 5. Added sa disable + rename (controls 2.13, 2.14, 2.17)
+-- 6. Added SQL Server Audit creation (control 5.4)
 --
 -- NOTE: Run the Ola Hallengren MaintenanceSolution separately.
 --       Download the LATEST version from https://ola.hallengren.com
@@ -104,6 +106,73 @@ GO
 
 -- Control 2.12: Hide Instance = Yes (UNCOMMENTED - was commented out)
 EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', N'SOFTWARE\Microsoft\Microsoft SQL Server\MSSQLServer\SuperSocketNetLib', N'HideInstance', REG_DWORD, 1
+GO
+
+-- ============================================================================
+-- CONTROL 2.13/2.14/2.17: DISABLE AND RENAME sa ACCOUNT
+-- ============================================================================
+
+USE [master]
+GO
+
+-- Disable and rename the sa account (controls 2.13, 2.14, 2.17)
+-- Uses SID 0x01 to find sa regardless of current name
+DECLARE @SAName SYSNAME
+SELECT @SAName = name FROM sys.server_principals WHERE sid = 0x01
+
+IF @SAName IS NOT NULL
+BEGIN
+    -- Disable it
+    IF EXISTS (SELECT * FROM sys.server_principals WHERE sid = 0x01 AND is_disabled = 0)
+        EXEC('ALTER LOGIN [' + @SAName + '] DISABLE');
+
+    -- Rename if still named 'sa'
+    IF @SAName = 'sa'
+        ALTER LOGIN [sa] WITH NAME = [COV_DBA_Disabled];
+END
+GO
+
+-- ============================================================================
+-- CONTROL 5.4: SQL SERVER AUDIT
+-- Creates server-level audit + specification for login/security events
+-- ============================================================================
+
+USE [master]
+GO
+
+-- Create the audit (writes to Windows Application Log)
+IF NOT EXISTS (SELECT * FROM sys.server_audits WHERE name = 'COV_Baseline_Audit')
+BEGIN
+    CREATE SERVER AUDIT [COV_Baseline_Audit]
+    TO APPLICATION_LOG
+    WITH (
+        QUEUE_DELAY = 1000,
+        ON_FAILURE = CONTINUE
+    );
+END
+GO
+
+-- Enable the audit
+ALTER SERVER AUDIT [COV_Baseline_Audit] WITH (STATE = ON);
+GO
+
+-- Create audit specification
+IF NOT EXISTS (SELECT * FROM sys.server_audit_specifications WHERE name = 'COV_Baseline_Audit_Spec')
+BEGIN
+    CREATE SERVER AUDIT SPECIFICATION [COV_Baseline_Audit_Spec]
+    FOR SERVER AUDIT [COV_Baseline_Audit]
+    ADD (FAILED_LOGIN_GROUP),
+    ADD (SUCCESSFUL_LOGIN_GROUP),
+    ADD (LOGIN_CHANGE_PASSWORD_GROUP),
+    ADD (SERVER_ROLE_MEMBER_CHANGE_GROUP),
+    ADD (DATABASE_ROLE_MEMBER_CHANGE_GROUP),
+    ADD (SERVER_PERMISSION_CHANGE_GROUP),
+    ADD (DATABASE_PERMISSION_CHANGE_GROUP),
+    ADD (AUDIT_CHANGE_GROUP),
+    ADD (SERVER_PRINCIPAL_CHANGE_GROUP),
+    ADD (DATABASE_PRINCIPAL_CHANGE_GROUP)
+    WITH (STATE = ON);
+END
 GO
 
 -- ============================================================================
