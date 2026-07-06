@@ -4,7 +4,7 @@ Deployment and hardening scripts for SQL Server 2025 in the COV environment, ali
 
 ## Execution Order
 
-Run scripts 0–8 during initial server deployment. Run script 9 after deployment to produce a compliance log.
+Run scripts 0–8 during initial server deployment. Run script 9 after deployment to produce a compliance log. **Restart the SQL Server service** after script 8 for ForceEncryption to take effect.
 
 | # | File | Purpose |
 |---|------|---------|
@@ -12,13 +12,13 @@ Run scripts 0–8 during initial server deployment. Run script 9 after deploymen
 | 1 | `1-GeneralAlerts.sql` | Create severity 17–25 alerts, I/O alerts, memory paging alerts |
 | 2 | `2-AddOperatorToAlertsAndNotifications.sql` | Create CESC-DBA operator and attach to all alerts/jobs |
 | 2a | `2a-AddAgencyOperatorToAlertsAndNotifications.sql` | Template for adding agency-specific operator (edit name/email before running) |
-| 3 | `3-ServerHardening.sql` | All sp_configure hardening, registry writes, extended stored proc revocations |
+| 3 | `3-ServerHardening.sql` | sp_configure hardening, registry writes, xp revocations, sa disable/rename, SQL Server Audit |
 | 4 | `4-CycleErrorLog.sql` | Create weekly error log cycle job |
 | 5 | `5-AddextendedAttributesMSDB.sql` | Add documentation metadata (agency, contact, app name) to MSDB |
 | 6 | `6-SetIdleCPUConditionAndCompressBackups.sql` | Enable backup compression default and SQL Agent CPU poller |
 | 7 | `7-Windows2025_Registry_updates.reg` | OS-level registry settings: TLS, memory, filesystem, NTFS |
-| 8 | `8-CHECK_for_SSL.sql` | Verify all connections are encrypted (control 7.4) |
-| 9 | `9-BaselineComplianceAudit.sql` | Compliance log — verifies deployment scripts ran AND all 38 baseline controls pass |
+| 8 | `8-CHECK_for_SSL.sql` | Set ForceEncryption=1 via registry and verify connections (control 7.4) |
+| 9 | `9-BaselineComplianceAudit.sql` | Compliance audit — verifies deployment + all 38 controls, with summary of failures |
 
 ## Changes from Previous (2019/2022) Scripts
 
@@ -29,6 +29,8 @@ Run scripts 0–8 during initial server deployment. Run script 9 after deploymen
 - **Added** `sp_configure 'remote admin connections', 0` — control 2.7 was missing
 - **Added** `sp_configure 'xp_cmdshell', 0` — control 2.15 was missing
 - **Uncommented** Hide Instance registry write — control 2.12 was commented out in the original, meaning it never executed
+- **Added** sa account disable + rename to `COV_DBA_Disabled` — controls 2.13, 2.14, 2.17; uses SID 0x01 lookup for idempotent re-runs
+- **Added** SQL Server Audit (`COV_Baseline_Audit`) with 10 event groups — control 5.4 was completely missing; audits login, password, role, and permission changes
 
 ### `4-CycleErrorLog.sql`
 
@@ -43,11 +45,14 @@ Run scripts 0–8 during initial server deployment. Run script 9 after deploymen
 ### `8-CHECK_for_SSL.sql`
 
 - **Flipped** the query from `WHERE encrypt_option = 'TRUE'` to `WHERE encrypt_option = 'FALSE'` — the old query showed encrypted connections (proves nothing); the new query finds unencrypted connections (which is what indicates a failure of control 7.4)
+- **Added** `xp_instance_regwrite ... ForceEncryption, REG_DWORD, 1` — now actively enforces encryption (control 7.4) instead of just checking; requires SQL Server service restart to take effect
 
 ### `9-BaselineComplianceAudit.sql` (new file)
 
-- **Part 1:** Checks that each deployment script (0–8) ran successfully by verifying their artifacts exist (mail accounts, alerts, operators, sp_configure values, jobs, registry settings, encryption status)
+- **Part 1:** Checks that each deployment script (0–8) ran successfully by verifying their artifacts exist (mail accounts, alerts, operators, sp_configure values, jobs, registry settings, sa rename, audit, ForceEncryption)
 - **Part 2:** Audits all 38 baseline controls individually with PASS/FAIL/EXCEPTION output
+- **Summary section:** Collects all FAIL/WARNING items into a single table at the end for quick triage
+- **Fixed** `status_desc` → `is_state_enabled` in `sys.server_audits` query (SQL 2022 compatibility)
 
 ## Files With No Changes
 
@@ -62,5 +67,7 @@ Run scripts 0–8 during initial server deployment. Run script 9 after deploymen
 
 - The Ola Hallengren Maintenance Solution (`DatabaseBackup`, `DatabaseIntegrityCheck`, `IndexOptimize`) should be downloaded separately from https://ola.hallengren.com and run before these scripts. The version bundled in the old `3-MaintenanceSolution-2012-2022.sql` is from 2020 and should be updated for SQL 2025 compatibility.
 - Script 7 (`.reg` file) must be run at the OS level (double-click or `regedit /s`), not from within SQL Server.
+- Script 8 sets ForceEncryption via registry — a **SQL Server service restart** is required afterward. Ensure a valid TLS certificate is assigned in SQL Server Configuration Manager before restarting.
 - Replace all instances of `ReplaceThisWithServerInstanceNameToken` with the actual server name before running.
+- All scripts are idempotent — safe to re-run on servers where they've already been applied.
 - If TLS 1.0 is still required by legacy applications, re-enable it in the .reg file and document as a formal exception in the baseline.
